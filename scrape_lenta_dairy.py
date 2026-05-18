@@ -13,6 +13,7 @@ import argparse
 import csv
 import re
 import sys
+import time
 from datetime import date
 from pathlib import Path
 from typing import TypedDict
@@ -84,6 +85,16 @@ def normalize_price(text: str) -> str:
     if not m:
         return ""
     return m.group(0).replace(".", ",")
+
+
+def cents_to_price(value: object) -> str:
+    try:
+        cents = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return ""
+    rub = cents / 100
+    txt = f"{rub:.2f}".rstrip("0").rstrip(".")
+    return txt.replace(".", ",")
 
 
 def scroll_until_loaded(page, pause_ms: int = 700, stable_rounds: int = 4, max_rounds: int = 60) -> None:
@@ -168,12 +179,75 @@ def collect_products(page) -> list[ProductRow]:
     return rows
 
 
+def collect_products_via_api(page) -> list[ProductRow]:
+    api_url = "https://lenta.com/api-gateway/v1/catalog/items"
+    base_payload = {
+        "categoryId": 3,
+        "filters": {"checkbox": [], "multicheckbox": [], "range": []},
+        "sort": {"type": "popular", "order": "desc"},
+        "limit": 100,
+        "offset": 0,
+    }
+    rows: list[ProductRow] = []
+    seen_names: set[str] = set()
+
+    for _ in range(15):
+        payload = dict(base_payload)
+        payload["offset"] = len(rows)
+        try:
+            page_json = page.evaluate(
+                """async ({apiUrl, payload}) => {
+                    const resp = await fetch(apiUrl, {
+                        method: "POST",
+                        credentials: "include",
+                        headers: { "content-type": "application/json" },
+                        body: JSON.stringify(payload),
+                    });
+                    if (!resp.ok) {
+                        throw new Error(`catalog/items HTTP ${resp.status}`);
+                    }
+                    return await resp.json();
+                }""",
+                {"apiUrl": api_url, "payload": payload},
+            )
+        except Exception:
+            break
+        items = page_json.get("items") if isinstance(page_json, dict) else None
+        if not isinstance(items, list) or not items:
+            break
+
+        added = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = normalize_spaces(str(item.get("name") or ""))
+            if not name or name in seen_names:
+                continue
+            seen_names.add(name)
+            prices = item.get("prices") if isinstance(item.get("prices"), dict) else {}
+            price_now = cents_to_price(prices.get("price")) if isinstance(prices, dict) else ""
+            price_reg = cents_to_price(prices.get("priceRegular")) if isinstance(prices, dict) else ""
+            rows.append(
+                ProductRow(
+                    магазин="",
+                    дата_парсинга="",
+                    наименование=name,
+                    цена=price_now or price_reg,
+                )
+            )
+            added += 1
+        if added == 0:
+            break
+    return rows
+
+
 def scrape(
     url: str,
     cookie_header: str,
     expected_address: str,
     headed: bool,
     timeout_sec: float,
+    manual_wait: bool,
 ) -> tuple[str, list[ProductRow]]:
     timeout_ms = int(timeout_sec * 1000)
     with sync_playwright() as p:
@@ -192,8 +266,16 @@ def scrape(
         page = context.new_page()
         try:
             cards_loaded = False
+            last_error: Exception | None = None
             for attempt in range(1, 4):
-                page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < 3:
+                        time.sleep(2)
+                        continue
+                    break
                 try:
                     page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 10000))
                 except PlaywrightTimeoutError:
@@ -203,12 +285,35 @@ def scrape(
                     cards_loaded = True
                     break
                 except PlaywrightTimeoutError:
+                    last_error = PlaywrightTimeoutError("catalog cards not loaded in time")
                     if attempt < 3:
                         page.wait_for_timeout(2000)
             if not cards_loaded:
-                raise RuntimeError(
-                    "Карточки товаров не загрузились. Проверьте актуальность cookie и выбранный адрес."
-                )
+                if manual_wait and headed:
+                    print(
+                        (
+                            "Карточки не появились автоматически. "
+                            "Откройте страницу руками (проверьте адрес/капчу), затем нажмите Enter..."
+                        ),
+                        file=sys.stderr,
+                    )
+                    input()
+                    page.wait_for_timeout(1500)
+                    if page.locator("lu-product-card").count() > 0:
+                        cards_loaded = True
+                if not cards_loaded:
+                    # Fallback: иногда карточки в DOM не появляются, но API из страницы доступен.
+                    fallback_rows = collect_products_via_api(page)
+                    if fallback_rows:
+                        return extract_store_label(page), fallback_rows
+                    if last_error is not None:
+                        raise RuntimeError(
+                            "Не удалось открыть страницу каталога стабильно. "
+                            f"Последняя ошибка: {last_error}"
+                        )
+                    raise RuntimeError(
+                        "Карточки товаров не загрузились. Проверьте актуальность cookie и выбранный адрес."
+                    )
 
             scroll_until_loaded(page)
             store_label = extract_store_label(page)
@@ -269,6 +374,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Запуск с видимым окном браузера (если не указан - headless)",
     )
+    parser.add_argument(
+        "--manual-wait",
+        action="store_true",
+        help="Только для --headed: ручная пауза перед сбором, если карточки не прогрузились",
+    )
     return parser
 
 
@@ -289,6 +399,7 @@ def main() -> int:
             expected_address=args.expected_address,
             headed=args.headed,
             timeout_sec=args.timeout,
+            manual_wait=args.manual_wait,
         )
         if not rows:
             print("Товары не найдены. Проверьте cookie/доступность страницы.", file=sys.stderr)
